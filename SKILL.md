@@ -96,10 +96,28 @@ its traffic is blocked rather than leaking direct. Passing `upstream` inline
 in step 2 creates a slot for you automatically.
 
 **3 — Wait for the endpoint to go live.** Poll `vpn2proxy.endpoints.list` and
-match on `id` until `applyState === "applied"` (watch `applyNote`; `failed`
-carries the reason). A missing region host shows as `hostStatus`/`hostStale`.
-Requests are queued per region — budget 30–60s, and do not poll faster than
-every ~5s.
+match on `id` until `applyState === "applied"`. Work is queued per region, so
+budget 30–120s and poll no faster than every ~5s.
+
+If it never leaves `queued` for several minutes, the region's host is not
+picking work up — check `hostStatus`/`hostStale` on the row and stop rather
+than polling forever.
+
+**3a — If it lands on `failed`, read `applyNote`.** It names the exact cause
+and never contains the credential. The overwhelmingly common one is an
+**unreachable upstream**, because the host probes the proxy before it will
+bring the tunnel up:
+
+```
+apply failed on host: error: upstream probe failed, config untouched:
+  endpoint-<id> [socks5]: CONNECT=FAIL (gaierror: [Errno -2] Name or service
+  not known), UDP: unprobed, 1 ms
+```
+
+`gaierror` means the proxy hostname does not resolve; a refused CONNECT or
+timeout means the proxy is not reachable or the credentials are wrong. The
+host leaves the previous config untouched, so a failed replace never breaks a
+working tunnel. Fix the proxy details, then `endpoints.reapply`.
 
 **4 — Request the device.**
 
@@ -148,6 +166,12 @@ app, `wg-quick`, or an OpenVPN client.
 - `endpoints.rotationPlan` is **read** scope and only reports; the write is
   `endpoints.replaceCredential`. A staged credential goes live after the host
   acks it, not immediately.
+- **The host probes your upstream before bringing the tunnel up**, so an
+  unreachable or unresolvable proxy is the most common reason an endpoint
+  lands on `failed`. `applyNote` says which.
+- **There is no endpoint-removal action.** Removal and revocation of
+  provisioned devices are dashboard operations; the API covers create, read,
+  update, and reassign.
 - Plan limits (endpoints, slots, connections) come from the account's plan,
   not from key grants.
 

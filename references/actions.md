@@ -34,6 +34,11 @@ proxySlotName, proxySlotSummary`
 - `applyState`: `queued` → `applying` → `applied`, or `failed` / `removing` / `removed`
 - `status`: `active` / `idle` / `error` / `disconnected` (derived from host health + an upstream probe — **not** a per-tunnel handshake)
 - `upstreamSummary` / `proxySlotSummary` are credential-free summaries, never credentials
+- `applyNote` carries the exact failure reason and is credential-free. The host
+  probes the upstream before applying, so `failed` is most often an unreachable
+  or unresolvable proxy: `upstream probe failed, config untouched: … CONNECT=FAIL
+  (gaierror: …)`. A `gaierror` is a DNS failure on the proxy host; a refused
+  CONNECT or timeout is reachability or bad credentials.
 
 ### `vpn2proxy.slots.list` — read
 No input. `data` = array of
@@ -144,3 +149,9 @@ these require a real admin **session**.
 - **No host actions** — host enrollment/report/claim is a separate
   region-token surface under `/api/hosts/*`, not the agent API.
 - **No `devices.list`** — poll `devices.profile` instead.
+- **No endpoint removal.** There is no action to remove an endpoint or revoke
+  a removed device; both are dashboard operations. The API covers create,
+  read, update, reassign, and credential replacement.
+- **MCP is off.** `POST /mcp` answers 404 unless the deployment sets
+  `MCP_ENABLED=yes`, and it is deliberately left unset. Do not build against
+  it.

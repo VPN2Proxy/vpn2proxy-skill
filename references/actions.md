@@ -53,14 +53,17 @@ Personal container only.
 Optional `limit` (default 12, cap 100). `data` = `{kind, message, createdAt}`,
 newest first. Includes your own `agent.action` audit rows.
 
-### `vpn2proxy.endpoints.rotationPlan` — read
-Required `endpointId`. `data` = `{endpointId, name, region, regionCity,
-provisioning, applyState, pendingReplacement, hasUpstream, eligible,
-blockers[], automated:false, steps[]}`. **Read-only report** — the executing
-write is `endpoints.replaceCredential`.
+`data` = `{endpointId, name, region, regionCity, provisioning, applyState,
+pendingReplacement, hasUpstream, eligible, ready, blockers[], automated:false,
+steps[]}`.
 
-## Writing
+**Branch on `ready`, not `eligible`.** `eligible` is authorization only (may this
+caller rotate the row at all) and stays `true` for an authorized caller whose
+rotation is blocked — e.g. an endpoint exiting through a saved proxy slot, where
+`blockers` explains it. `ready` is `eligible && blockers.length === 0`.
 
+**Read-only report** — the executing write is `endpoints.replaceCredential`
+(for slot-less endpoints) or `slots.update` (for slot-assigned ones).
 ### `vpn2proxy.endpoints.create` — write
 | Input | Required | Notes |
 |---|---|---|
@@ -83,9 +86,18 @@ sealed; the password is never returned.
 
 ### `vpn2proxy.slots.update` — write
 Required `slotId`. Optional `name`, `provider`, `server`, `port`, `username`,
-`password` — only what you pass is changed. `data` = `{slotId, renamed,
-connectionChanged}`. Changing connection fields may hit the Free-plan
-one-change-per-24h cooldown.
+`password` — only what you pass is changed.
+
+`data` = `{slotId, renamed, connectionChanged, requeuedEndpoints}`. This is the
+**supported way to change which proxy an endpoint exits through**: a connection
+change re-queues every endpoint using that slot (`applyState` → `queued`, note
+*"proxy slot reconfigured — the host will apply the new upstream"*), releases
+their claims, and wakes the region so the host re-applies (~30–60s). A rename
+changes nothing on the host and re-queues nothing.
+
+`requeuedEndpoints` tells you whether the change reached live tunnels — `0`
+means the slot has no live endpoints. Changing connection fields may hit the
+Free-plan one-change-per-24h cooldown (`field: "cooldown"`).
 
 ### `vpn2proxy.slots.remove` — write
 Required `slotId`. `data` = `{slotId, outcome:"removed", unassignedEndpoints}`.
@@ -101,6 +113,11 @@ Required `endpointId` and `upstream{server, port, password}`; optional
 credential; the host validates before switching, so a bad value never breaks a
 working tunnel. `data` = `{renamed, replacement:"none"|"staged"}`. Goes live
 only after the host acks — until then `pendingReplacement` is true.
+
+**Refused (400) when the endpoint has a proxy slot assigned.** The host claim
+reads the slot in preference to `endpoint_credential`, so a staged replacement
+would never be delivered. Use `slots.update` instead — see
+`vpn2proxy.slots.update`. Only slot-less (legacy) endpoints can stage here.
 
 ### `vpn2proxy.endpoints.reapply` — write
 Required `endpointId`. Re-queues the endpoint for the host. `data` =

@@ -103,6 +103,10 @@ If it never leaves `queued` for several minutes, the region's host is not
 picking work up — check `hostStatus`/`hostStale` on the row and stop rather
 than polling forever.
 
+**2c — To change which proxy an endpoint exits through later, update the slot
+(`slots.update`), not `endpoints.replaceCredential`** — see the trap list. It
+re-queues the endpoints using that slot and the host re-applies (~30–60s).
+
 **3a — If it lands on `failed`, read `applyNote`.** It names the exact cause
 and never contains the credential. The overwhelmingly common one is an
 **unreachable upstream**, because the host probes the proxy before it will
@@ -157,6 +161,13 @@ app, `wg-quick`, or an OpenVPN client.
 - **Two different waits, two different codes** — endpoint liveness is 404 on
   `devices.request`, device provisioning is 409 on `devices.profile`.
 - **`endpoints.create` ignores `proxySlotId`.** Use `endpoints.assign`.
+- **Rotating an endpoint's upstream: update the SLOT, not the endpoint.** If the
+  endpoint has a slot assigned, `endpoints.replaceCredential` is **refused (400)**
+  — the host reads the slot in preference to the endpoint's own credential, so an
+  endpoint-scoped replacement would be silently ignored. `slots.update` is the
+  supported path: it re-queues every endpoint using that slot and wakes the
+  region, and returns `requeuedEndpoints`. Because one slot can serve many
+  endpoints, editing the slot is also the honest blast radius.
 - **Admin-only actions** (`health.list`, `fleet.housekeeping`) are always 403
   for API keys, regardless of grants. They need a real admin session.
 - **404 also means "unknown action"** — check your spelling before assuming

@@ -64,6 +64,23 @@ missing or invalid key · `403` scope or admin refusal · `404` unknown action
 per-action summaries — the authoritative list, including scope. Prefer it
 over this file when they disagree.
 
+### `data` is not always an object
+
+Every **`*.list` action** returns `data` as a **bare array** —
+`regions.list`, `endpoints.list`, `slots.list`, `activity.list`. Every other
+action returns `data` as an **object** (`{endpoint}`, `{device}`, …). So code
+that assumes `data.get(...)` raises on the list actions, and code that assumes
+`for row in data` silently iterates zero times on the object-shaped ones.
+Normalise before you parse:
+
+```python
+d = env.get("data")
+rows = d if isinstance(d, list) else (d.get(key) or d.get("rows") or [])
+```
+
+`scripts/vpn2proxy-api.sh` prints `data` raw for exactly this reason — it
+cannot know which shape you are about to consume.
+
 ## Provisioning workflow
 
 Endpoint and device creation are **both asynchronous**: a host in the target
@@ -84,6 +101,14 @@ success on the creating call.
 
 `protocol` defaults to `wireguard` (anything not `"openvpn"` becomes
 `wireguard`). Returns `{endpoint:{…}}` with `applyState:"queued"`.
+
+The echoed row uses **`region`** and **`endpointHost`** — not `regionCode` or
+`host`, which are input/join names and are **absent** from the response (a
+`KeyError`, not a `null`). `hostStatus` and `hostStale` are present but are
+hardcoded `null`/`false` placeholders, because they are host-reported facts the
+create path has no way to know yet. So do not validate your input against the
+create response, and do not read `endpoint["regionCode"]` — poll
+`endpoints.list` (step 3) for the authoritative row.
 
 To keep credentials separately and reuse them, skip `upstream` here and use a
 slot instead (step 2b). `endpoints.create` **cannot** take a `proxySlotId`.
@@ -134,6 +159,11 @@ profile**. If the endpoint is not `applied` yet this returns **404** with
 "This endpoint is not live yet" — the same code as an unknown endpoint, so
 check the message and re-poll rather than giving up.
 
+**Persist the `deviceId` to disk the moment you get it, before any further
+call.** There is no `devices.list`, so a script that crashes between step 4 and
+step 6 has no way to recover that id, and the only remedy is provisioning a
+brand-new device.
+
 **5 — Wait for the profile, then fetch it.** Poll:
 
 ```bash
@@ -144,20 +174,140 @@ check the message and re-poll rather than giving up.
 - `404` → no such device.
 - `200` → `{"device":{…},"profile":"<wireguard or openvpn config text>"}`
 
+Budget generously: the region's host applies asynchronously and readiness is
+not instant — a WireGuard device has been observed still returning 409 after
+100s of 5-second polls. Poll every ~5s and give it at least two minutes before
+calling it stuck.
+
+### Branch on the status as a string
+
+If you hand-roll the call with `curl -w '%{http_code}'`, the status comes back
+as a **string**. `if code == 200:` is `False` for `"200"`, so a successful
+fetch silently falls through to your retry branch and you loop until you give
+up — discarding a credential the API handed you correctly, on every iteration.
+This is the single most expensive way to use this API:
+
+```python
+# WRONG — "200" != 200, every success looks like a failure
+if code == 200 and body.get("ok"): ...
+
+# RIGHT
+if code == "200" and body.get("ok"): ...
+```
+
+Prefer `scripts/vpn2proxy-api.sh`, which already compares
+`"$resp" != "200"` and exits non-zero on `ok:false`, so the status never has to
+be handled at all:
+
+```bash
+./scripts/vpn2proxy-api.sh vpn2proxy.devices.profile '{"deviceId":"…"}' > profile.raw
+```
+
+A mis-parsed retry loop does **not** burn the credential: re-polling the same
+`deviceId` inside the recovery window keeps returning `200` with the full
+profile, so you can recover with the id you already have rather than
+provisioning a new device. Do not rely on this though — persist the id.
+
 **6 — Write the config to the device.** `profile` is the raw config: for
 WireGuard a `.conf`, for OpenVPN an `.ovpn`. Hand it to the WireGuard/OpenVPN
 app, `wg-quick`, or an OpenVPN client.
 
+Write it straight to disk with restrictive permissions and never echo it:
+
+```python
+open(path, "w").write(profile); os.chmod(path, 0o600)
+```
+
+### The OpenVPN credentials are in COMMENTS — never strip `#` lines
+
+A vpn2proxy OpenVPN profile carries its client auth pair as **comment lines at
+the very top**, above the `client` directive:
+
+```bash
+# vpn2proxy OpenVPN profile for user: dev-6dfca498
+# vpn2proxy-auth-username: dev-6dfca498      <-- username
+# vpn2proxy-auth-password: <password>        <-- password
+# Enter the username and password in the VPN client's login fields.
+client
+dev tun
+...
+auth-user-pass                            <-- BARE: no argument, no file
+```
+
+**The single most common way to get this wrong is to filter out `#` lines**
+(`grep -v '^#'`, dropping "comments", an INI parser that discards them). That
+throws away the only place the credentials exist, and you will confidently
+report that the profile has no credentials. It does. Do not strip comments
+before searching for `# vpn2proxy-auth-`.
+
+Two more things that disguise the payload:
+
+- **`auth-user-pass` is bare.** It has no inline argument and no file
+  reference, so OpenVPN prompts interactively instead of reading the profile.
+  Inspecting the directive shows no credentials — that is expected, not
+  evidence of absence. (The generator ships the pair in comments precisely
+  because router clients expect a bare `auth-user-pass`.)
+- **The `#` lines come before `client`.** A "first line" check misses them.
+
+Extract them:
+
+```python
+u  = re.search(r'^# vpn2proxy-auth-username: (.+)$', p, re.M).group(1).strip()
+pw = re.search(r'^# vpn2proxy-auth-password: (.+)$', p, re.M).group(1).strip()
+```
+
+To make the profile self-contained, rewrite the bare directive into the inline
+block — this is exactly what the dashboard's "Embed credentials" toggle does:
+
+```
+<auth-user-pass>
+<username>
+<password>
+</auth-user-pass>
+```
+
+Older sealed profiles already use the inline `<auth-user-pass>…</auth-user-pass>`
+form, so support both shapes when parsing.
+
+### Telling OpenVPN and WireGuard profiles apart
+
+An OpenVPN profile's **first non-comment line is `client`**; a WireGuard
+profile starts with `[Interface]`. That is the reliable discriminator — but
+apply it to the first *non-comment* line, or the four leading `#` lines will
+make you misread an OpenVPN profile as unrecognisable.
+
+Do not discriminate by port: an OpenVPN profile uses port **51821**, which
+resembles a WireGuard port but is a real OpenVPN endpoint. Do not require an
+inline `<auth-user-pass>` either — see above. Certificate blocks
+(`-----BEGIN`, four of them) and `remote-cert-tls server` are good corroboration.
+
 ## Traps
 
 - **`devices.profile` is write-scoped** and is the only action that returns
-  credential material. A read-only key gets 403. It is also **one-time**:
-  after a short recovery window the sealed copy is wiped and you must call
-  `devices.request` again for a new credential. Never log the profile, never
-  commit it, never echo it into a transcript.
+  credential material. A read-only key gets 403. The sealed copy is eventually
+  wiped (a "recovery window" after which you must call `devices.request` again
+  for a new credential), but **re-reading it does not consume it** — repeated
+  200s inside that window each return the full profile. Never log the profile,
+  never commit it, never echo it into a transcript. Write it with `0600`.
+- **The OpenVPN auth pair lives in `#` comment lines at the top of the profile.**
+  Stripping comments (or trusting the bare `auth-user-pass` directive) hides the
+  only copy of the username and password. Always search the raw text for
+  `# vpn2proxy-auth-username:` / `# vpn2proxy-auth-password:` — see
+  "The OpenVPN credentials are in COMMENTS" above. This has caused a real
+  agent to report a profile had no credentials when it had both.
+- **OpenVPN profiles start with `client`** (after those comments); WireGuard
+  profiles start with `[Interface]`. Check the first non-comment line, and
+  never discriminate on the port — OpenVPN's is 51821.
+- **Comparing `curl -w '%{http_code}'` to an int silently loses a good
+  credential.** See "Branch on the status as a string" above — prefer the
+  wrapper script.
+- **`endpoints.create` echoes a sparse row** with `regionCode`/`host`/
+  `hostStatus` as `null` even on success. Poll `endpoints.list` for truth.
+- **`data` is an array for `regions.list` and an object elsewhere.** See
+  "`data` is not always an object" above.
 - **There is no `devices.list`.** You cannot read a device's state directly.
   Poll `devices.profile` and branch on 409 vs 200. `endpoints.list` carries
-  no device count either.
+  no device count either. Persist `deviceId` before you poll.
 - **Two different waits, two different codes** — endpoint liveness is 404 on
   `devices.request`, device provisioning is 409 on `devices.profile`.
 - **`endpoints.create` ignores `proxySlotId`.** Use `endpoints.assign`.

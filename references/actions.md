@@ -145,6 +145,30 @@ Poll this for readiness: **409** = not provisioned yet, **404** = no such
 device, **200** = profile ready. `profile` is a WireGuard `.conf` or an
 OpenVPN `.ovpn` document.
 
+**Parsing the OpenVPN variant — the credentials are in comments:**
+
+```bash
+# vpn2proxy OpenVPN profile for user: dev-6dfca498
+# vpn2proxy-auth-username: dev-6dfca498
+# vpn2proxy-auth-password: <password>
+# Enter the username and password in the VPN client's login fields.
+client
+...
+auth-user-pass          # BARE — no inline argument, no file reference
+```
+
+- The username/password are the two `# vpn2proxy-auth-*` lines **at the top**.
+  Never strip `#` lines before searching — that discards the only copy, and the
+  bare `auth-user-pass` directive then makes the profile look credential-less.
+- To embed, replace the bare `auth-user-pass` line with an inline
+  `<auth-user-pass>` block (what the dashboard toggle does). Older profiles
+  already use the inline form; support both when parsing.
+- Detect the format by the first **non-comment** line: `client` = OpenVPN,
+  `[Interface]` = WireGuard. Not by port — OpenVPN uses 51821.
+
+The WireGuard variant needs no extra credential: its private key is already in
+`[Interface]`, and the server's public key is in `[Peer]`.
+
 ### `vpn2proxy.devices.disable` — write
 Required `deviceId`. Queues credential revocation and frees an account-wide
 connection slot; the owning host removes it on a later pass. `data` =

@@ -311,6 +311,16 @@ inline `<auth-user-pass>` either — see above. Certificate blocks
 - **Two different waits, two different codes** — endpoint liveness is 404 on
   `devices.request`, device provisioning is 409 on `devices.profile`.
 - **`endpoints.create` ignores `proxySlotId`.** Use `endpoints.assign`.
+- **`endpoints.rename` for labels; never `replaceCredential` to rename.** A
+  replacement stages a credential as a side effect. `endpoints.rename` is
+  label-only and does not re-queue.
+- **Staged the wrong credential? `endpoints.cancelReplacement`.** It drops the
+  pending one and leaves the live one serving; the row also returns to `applied`
+  if nothing had been delivered yet.
+- **`endpoints.remove` is a CASCADE, not just a row delete.** It revokes every
+  client config's peer on the host in the same pass — configs are connection
+  credentials, so there is nothing left to clean up by hand. `outcome:"removing"`
+  means the host still has teardown to do; poll `endpoints.list` for `removed`.
 - **Rotating an endpoint's upstream: update the SLOT, not the endpoint.** If the
   endpoint has a slot assigned, `endpoints.replaceCredential` is **refused (400)**
   — the host reads the slot in preference to the endpoint's own credential, so an

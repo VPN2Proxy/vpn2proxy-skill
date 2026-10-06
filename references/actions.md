@@ -124,6 +124,36 @@ Required `endpointId`. Re-queues the endpoint for the host. `data` =
 `{endpointId, applyState:"queued"}`. Used after changing a credential or to
 recover a `failed` endpoint.
 
+### `vpn2proxy.endpoints.rename` — write
+Required `endpointId` and `name`. Label-only — host addressing is id-based, so
+this never re-queues the endpoint and never touches credentials. `data` =
+`{endpointId, renamed, name}`. Use this for a pure rename; reaching for
+`replaceCredential` to rename would stage a credential replacement as a side
+effect.
+
+### `vpn2proxy.endpoints.cancelReplacement` — write
+Required `endpointId`. Drops a **staged** upstream credential; the previously
+live one keeps serving. `data` = `{endpointId, cancelled:true}`. The row returns
+to `applied` when nothing had been delivered yet, so this also un-queues an
+endpoint left mid-flight by a `replaceCredential` you no longer want. Refused
+(404) when there is no staged replacement, and on `applying` rows.
+
+### `vpn2proxy.endpoints.remove` — write
+Required `endpointId`. `data` = `{endpointId, outcome:"removing"}`.
+
+**Cascade:** a client config is a connection credential, not a sub-resource to
+clean up by hand — every device on the endpoint is queued for peer revocation on
+the host in the same pass. That covers `artemis-acct5`-style leftovers too, so
+retiring an endpoint does not strand live configs.
+
+`outcome:"removing"` means the host still has teardown to do; poll
+`endpoints.list` until the row reports `removed`. An endpoint that was never
+claimed by a host is deleted outright instead and settles immediately.
+
+Refused (404) while the row is `removing` or already `removed`, and while the
+host is mid-`applying` — wait for the host to confirm, then retry. Same core as
+the dashboard's **Remove** button, so behaviour cannot drift between surfaces.
+
 ### `vpn2proxy.devices.request` — write
 Required `endpointId` (must be `provisioning:"provisioned"` **and**
 `applyState:"applied"`, else 404 "This endpoint is not live yet") and `name`
